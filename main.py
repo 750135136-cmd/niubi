@@ -8,21 +8,26 @@ from collections import deque
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, Channel
 from telethon.errors import FloodWaitError
+
 # ========== 配置项 ==========
-api_id = 25559912
-api_hash = '22d3bb9665ad7e6a86e89c1445672e07'
+api_id = 25559912  # 请立即替换为你重置后的新api_id
+api_hash = '22d3bb9665ad7e6a86e89c1445672e07'  # 请立即替换为你重置后的新api_hash
 session_name = "session"
+
+# 频道转发配对，可自由增减
 channels = [
     {'source': '@wenan77','target': '@wnffx'},
-    {'source': '@xdgd18','target': '@hrgxx'},
     {'source': '@chigua_a','target': '@hrgxx'}
 ]
-max_text_length = 100
-forward_interval = 3
-media_group_wait_time = 5
-max_cache_size = 2000
-restart_interval_hours = 12
+
+max_text_length = 300  # 最大允许的文本长度
+forward_interval = 5  # 转发间隔（秒），已调大降低限流风险
+media_group_wait_time = 12  # 媒体组等待时长（秒），核心修复项，确保同组内容完整接收
+max_cache_size = 2000  # 已处理消息ID缓存上限
+restart_interval_hours = 12  # 定时重启间隔（小时）
+max_retry = 5  # 发送失败最大重试次数
 ALLOWED_VIDEO_MIMES = {'video/mp4', 'video/mov', 'video/avi', 'video/mkv', 'video/webm', 'video/flv'}
+
 # ========== 全局状态 ==========
 stop_event = asyncio.Event()
 shutdown_lock = asyncio.Lock()
@@ -37,16 +42,20 @@ channel_map = {}
 valid_source_ids = []
 active_tasks = set()
 client = None
+
 # ========== 工具函数 ==========
 def log_with_time(msg: str):
     beijing_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{beijing_time}] {msg}")
+
 def clean_text(text):
     if not text:
         return ""
+    # 清除链接、@用户名、多余换行
     text = re.sub(r'https?://[^\s\u4e00-\u9fa5，。！？；：""''()（）、]+|t\.me/[^\s\u4e00-\u9fa5，。！？；：""''()（）、]+', '', text)
     text = re.sub(r'@[a-zA-Z0-9_]{5,32}', '', text)
     return re.sub(r'\n+', '\n', text).strip()
+
 async def rate_limit_wait():
     global last_forward_time
     async with forward_lock:
@@ -55,9 +64,11 @@ async def rate_limit_wait():
         if wait_time > 0:
             await asyncio.sleep(wait_time)
         last_forward_time = time.time()
+
 def track_task(task):
     active_tasks.add(task)
     task.add_done_callback(active_tasks.discard)
+
 # ========== 定时重启 ==========
 async def auto_restart_scheduler():
     while True:
@@ -67,6 +78,7 @@ async def auto_restart_scheduler():
         log_with_time("⏰ 到达定时重启时间，准备优雅重启服务...")
         stop_event.set()
         break
+
 # ========== 优雅关闭 ==========
 async def graceful_shutdown(client: TelegramClient):
     global is_shutting_down
@@ -80,9 +92,11 @@ async def graceful_shutdown(client: TelegramClient):
     log_with_time("✅ 所有任务已完成，正在断开客户端连接...")
     await client.disconnect()
     log_with_time("✅ 客户端已正常断开，进程即将退出")
+
 async def stop_watcher(client: TelegramClient):
     await stop_event.wait()
     await graceful_shutdown(client)
+
 # ========== 频道校验 ==========
 async def check_channels(client: TelegramClient, me):
     log_with_time("=== 正在检查频道配置 ===")
@@ -135,11 +149,11 @@ async def check_channels(client: TelegramClient, me):
     else:
         log_with_time("\n❌ 无可用频道配置，程序无法启动")
     return len(valid_channels) > 0
+
 # ========== 媒体组处理 ==========
 async def process_media_group(grouped_id):
     global client
     try:
-        await asyncio.sleep(media_group_wait_time)
         async with media_group_lock:
             if grouped_id not in media_group_cache:
                 return
@@ -150,6 +164,17 @@ async def process_media_group(grouped_id):
         if (source_chat.id, first_msg.id) in processed_msg_ids:
             log_with_time(f"⏭️  已跳过 | 源：{source_name} | 同一条消息已转发")
             return
+        
+        # 【新增】拦截带按钮的媒体组消息，同组任意一条消息带按钮直接拦截
+        has_button = False
+        for msg in msg_list:
+            if msg.reply_markup and hasattr(msg.reply_markup, 'rows') and len(msg.reply_markup.rows) > 0:
+                has_button = True
+                break
+        if has_button:
+            log_with_time(f"⏭️  已拦截 | 源：{source_name} | 媒体组消息带有按钮，不符合转发规则")
+            return
+        
         processed_msg_ids.append( (source_chat.id, first_msg.id) )
         
         # 过滤有效媒体
@@ -179,23 +204,28 @@ async def process_media_group(grouped_id):
             return
         
         await rate_limit_wait()
-        # 限流重试
-        retry_count, max_retry = 0, 3
-        while retry_count < max_retry:
+        # 全有或全无重试逻辑，修复部分发送导致的拆分
+        retry_count = 0
+        send_success = False
+        while retry_count < max_retry and not send_success:
             try:
                 await client.send_message(target_item['target_entity'], message=cleaned_text, file=valid_media, silent=True)
                 log_with_time(f"✅ 媒体组转发成功 | 源：{source_name} → 目标：{target_item['target']} | 媒体数：{len(valid_media)}")
+                send_success = True
                 break
             except FloodWaitError as e:
                 retry_count += 1
-                wait_time = e.seconds
+                wait_time = e.seconds + 5  # 额外增加等待时长，避免再次触发限流
                 log_with_time(f"⚠️  触发限流，等待{wait_time}秒后重试（第{retry_count}次）")
                 await asyncio.sleep(wait_time)
             except Exception as e:
-                log_with_time(f"❌ 媒体组转发失败 | 详情：{str(e)}")
-                break
+                retry_count += 1
+                log_with_time(f"❌ 媒体组转发失败，第{retry_count}次重试 | 详情：{str(e)}")
+                await asyncio.sleep(3)
+        if not send_success:
+            log_with_time(f"❌ 媒体组最终转发失败，已跳过 | 源：{source_name}")
     except Exception as e:
-        # 【全局兜底】任何媒体组处理异常，都不会导致程序崩溃
+        # 全局兜底，任何异常不导致程序崩溃
         if "Could not find a matching Constructor ID" in str(e):
             log_with_time(f"⚠️  跳过无法解析的媒体组消息 | 详情：Telegram协议不兼容，已跳过该条消息")
         else:
@@ -203,6 +233,7 @@ async def process_media_group(grouped_id):
         async with media_group_lock:
             if grouped_id in media_group_cache:
                 del media_group_cache[grouped_id]
+
 # ========== 主程序 ==========
 async def main():
     global client
@@ -235,8 +266,8 @@ async def main():
         
         # 规则打印
         log_with_time("\n=== 转发规则已生效 ===")
-        log_with_time(f"✅ 允许转发：带图片/视频的消息（含多图媒体组），清洗后文本≤{max_text_length}字")
-        log_with_time(f"❌ 禁止转发：纯文字消息、文本超{max_text_length}字的消息、非图片/视频媒体")
+        log_with_time(f"✅ 允许转发：带图片/视频的消息（含多图媒体组），清洗后文本≤{max_text_length}字，无按钮")
+        log_with_time(f"❌ 禁止转发：纯文字消息、文本超{max_text_length}字的消息、非图片/视频媒体、带按钮的消息")
         log_with_time(f"⏰ 定时重启：已开启，每{restart_interval_hours}小时自动重启一次")
         log_with_time(f"🕵️  无来源转发：已开启，转发消息无任何原频道标识")
         for idx, channel in enumerate(valid_channels):
@@ -252,7 +283,7 @@ async def main():
         async def handler(event):
             if is_shutting_down:
                 return
-            # 【全局兜底】单条消息的任何异常，都不会导致整个程序崩溃
+            # 全局兜底，单条消息异常不导致程序崩溃
             try:
                 msg = event.message
                 source_chat = event.chat
@@ -265,16 +296,30 @@ async def main():
                     log_with_time(f"⏭️  已拦截 | 源：{source_name} | 无匹配目标频道")
                     return
                 
-                # 处理媒体组（多图/多视频）
+                # 【新增】拦截带按钮的单条消息，优先执行
+                if msg.reply_markup and hasattr(msg.reply_markup, 'rows') and len(msg.reply_markup.rows) > 0:
+                    log_with_time(f"⏭️  已拦截 | 源：{source_name} | 消息带有按钮，不符合转发规则")
+                    return
+                
+                # 【核心修复】媒体组处理逻辑，彻底解决拆分问题
                 if grouped_id:
                     async with media_group_lock:
-                        if grouped_id not in media_group_cache:
+                        is_new_group = grouped_id not in media_group_cache
+                        if is_new_group:
+                            # 新分组初始化缓存
                             media_group_cache[grouped_id] = {
                                 'msg_list': [], 'source_chat': source_chat,
                                 'target_item': target_item, 'source_name': source_name
                             }
-                            track_task(asyncio.create_task(process_media_group(grouped_id)))
+                        # 追加当前消息到分组
                         media_group_cache[grouped_id]['msg_list'].append(msg)
+                        # 仅新分组创建延迟处理任务，确保所有同组消息都能追加完成
+                        if is_new_group:
+                            async def delayed_process():
+                                # 等待完整时长后再处理，确保同组所有消息已接收
+                                await asyncio.sleep(media_group_wait_time)
+                                await process_media_group(grouped_id)
+                            track_task(asyncio.create_task(delayed_process()))
                     return
                 
                 # 处理单媒体消息（单图/单视频）
@@ -306,23 +351,28 @@ async def main():
                     return
                 
                 await rate_limit_wait()
-                # 限流重试
-                retry_count, max_retry = 0, 3
-                while retry_count < max_retry:
+                # 单媒体重试逻辑
+                retry_count = 0
+                send_success = False
+                while retry_count < max_retry and not send_success:
                     try:
                         await client.send_message(target_item['target_entity'], message=cleaned_text, file=valid_media, silent=True)
                         log_with_time(f"✅ 单媒体转发成功 | 源：{source_name} → 目标：{target_item['target']}")
+                        send_success = True
                         break
                     except FloodWaitError as e:
                         retry_count += 1
-                        wait_time = e.seconds
+                        wait_time = e.seconds + 5
                         log_with_time(f"⚠️  触发限流，等待{wait_time}秒后重试（第{retry_count}次）")
                         await asyncio.sleep(wait_time)
                     except Exception as e:
-                        log_with_time(f"❌ 单媒体转发失败 | 详情：{str(e)}")
-                        break
+                        retry_count += 1
+                        log_with_time(f"❌ 单媒体转发失败，第{retry_count}次重试 | 详情：{str(e)}")
+                        await asyncio.sleep(3)
+                if not send_success:
+                    log_with_time(f"❌ 单媒体最终转发失败，已跳过 | 源：{source_name}")
             except Exception as e:
-                # 【核心兜底】捕获协议解析错误，避免程序崩溃
+                # 核心兜底，捕获协议解析错误
                 if "Could not find a matching Constructor ID" in str(e):
                     log_with_time(f"⚠️  跳过无法解析的消息 | 详情：Telegram协议不兼容，已跳过该条消息")
                 else:
