@@ -5,7 +5,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from collections import deque
-from telethon import TelegramClient, events, connection
+from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, Channel
 from telethon.errors import FloodWaitError
 # ========== 配置项 ==========
@@ -232,15 +232,13 @@ async def process_media_group(grouped_id):
 # ========== 主程序 ==========
 async def main():
     global client
-    # 已优化连接配置，提升稳定性，减少断开重连
+    # 已优化兼容的连接配置，移除不兼容的自定义连接类型
     client = TelegramClient(
         session_name, api_id, api_hash,
         auto_reconnect=True, connection_retries=None, retry_delay=5, timeout=60,
         flood_sleep_threshold=120, catch_up=True,
         device_model="Pixel 7", system_version="Android 14", app_version="10.13.0",
         lang_code="zh-CN", system_lang_code="zh-CN",
-        connection=connection.TCPFull,  # 更稳定的全连接模式
-        use_ipv6=False,  # 强制IPv4，避免IPv6网络波动导致断开
         receive_updates=True
     )
     async with client:
