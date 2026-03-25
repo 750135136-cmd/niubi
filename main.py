@@ -15,7 +15,7 @@ session_name = "session"
 # 频道转发配对，可自由增减
 channels = [
     {'source': '@wenan77','target': '@wnffx'},
-    {'source': '@chigua_a','target': '@hrgxx'}
+    {'source': '@xdgd18','target': '@hrgxx'}
 ]
 max_text_length = 300  # 最大允许的文本长度
 forward_interval = 5  # 转发间隔（秒），已调大降低限流风险
