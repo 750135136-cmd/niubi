@@ -28,6 +28,7 @@ ALLOWED_VIDEO_MIMES = {'video/mp4', 'video/mov', 'video/avi', 'video/mkv', 'vide
 stop_event = asyncio.Event()
 shutdown_lock = asyncio.Lock()
 is_shutting_down = False
+is_restarting = False  # 新增：防重复重启标记
 last_forward_time = 0
 forward_lock = asyncio.Lock()
 processed_msg_ids = deque(maxlen=max_cache_size)
@@ -42,6 +43,17 @@ client = None
 def log_with_time(msg: str):
     beijing_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{beijing_time}] {msg}")
+
+# 新增：进程自重启核心函数
+def restart_program():
+    global is_restarting
+    if is_restarting:
+        return
+    is_restarting = True
+    log_with_time("🔄 开始执行进程自重启...")
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)  # 替换当前进程，实现无缝重启
+
 def clean_text(text):
     if not text:
         return ""
@@ -49,6 +61,7 @@ def clean_text(text):
     text = re.sub(r"https?://[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+|t\.me/[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+", '', text)
     text = re.sub(r"@[a-zA-Z0-9_]{5,32}", '', text)
     return re.sub(r"\n+", '\n', text).strip()
+
 async def rate_limit_wait():
     global last_forward_time
     async with forward_lock:
@@ -57,23 +70,26 @@ async def rate_limit_wait():
         if wait_time > 0:
             await asyncio.sleep(wait_time)
         last_forward_time = time.time()
+
 def track_task(task):
     active_tasks.add(task)
     task.add_done_callback(active_tasks.discard)
+
 # ========== 定时重启 ==========
 async def auto_restart_scheduler():
     while True:
         await asyncio.sleep(restart_interval_hours * 3600)
-        if is_shutting_down:
+        if is_shutting_down or is_restarting:
             break
         log_with_time("⏰ 到达定时重启时间，准备优雅重启服务...")
         stop_event.set()
         break
-# ========== 优雅关闭（已修复死锁+加超时保护） ==========
+
+# ========== 优雅关闭（修改：关闭后执行自重启） ==========
 async def graceful_shutdown(client: TelegramClient):
     global is_shutting_down
     async with shutdown_lock:
-        if is_shutting_down:
+        if is_shutting_down or is_restarting:
             return
         is_shutting_down = True
     log_with_time("🔌 开始优雅关闭，等待所有活跃任务完成...")
@@ -88,12 +104,16 @@ async def graceful_shutdown(client: TelegramClient):
     try:
         # 断开连接也加超时，避免网络异常卡死
         await asyncio.wait_for(client.disconnect(), timeout=10)
-        log_with_time("✅ 客户端已正常断开，进程即将退出")
+        log_with_time("✅ 客户端已正常断开，即将执行自重启")
     except Exception as e:
-        log_with_time(f"⚠️  断开连接时出错：{str(e)}，强制退出进程")
+        log_with_time(f"⚠️  断开连接时出错：{str(e)}，强制执行自重启")
+    # 核心修改：关闭完成后执行自重启
+    restart_program()
+
 async def stop_watcher(client: TelegramClient):
     await stop_event.wait()
     await graceful_shutdown(client)
+
 # ========== 频道校验 ==========
 async def check_channels(client: TelegramClient, me):
     log_with_time("=== 正在检查频道配置 ===")
@@ -146,6 +166,7 @@ async def check_channels(client: TelegramClient, me):
     else:
         log_with_time("\n❌ 无可用频道配置，程序无法启动")
     return len(valid_channels) > 0
+
 # ========== 媒体组处理 ==========
 async def process_media_group(grouped_id):
     global client
@@ -229,6 +250,7 @@ async def process_media_group(grouped_id):
         async with media_group_lock:
             if grouped_id in media_group_cache:
                 del media_group_cache[grouped_id]
+
 # ========== 主程序 ==========
 async def main():
     global client
@@ -265,7 +287,7 @@ async def main():
         log_with_time("\n=== 转发规则已生效 ===")
         log_with_time(f"✅ 允许转发：带图片/视频的消息（含多图媒体组），清洗后文本≤{max_text_length}字，无按钮")
         log_with_time(f"❌ 禁止转发：纯文字消息、文本超{max_text_length}字的消息、非图片/视频媒体、带按钮的消息")
-        log_with_time(f"⏰ 定时重启：已开启，每{restart_interval_hours}小时自动重启一次")
+        log_with_time(f"⏰ 定时重启：已开启，每{restart_interval_hours}小时自动重启一次（内置自重启，无需平台干预）")
         log_with_time(f"🕵️  无来源转发：已开启，转发消息无任何原频道标识")
         for idx, channel in enumerate(valid_channels):
             log_with_time(f"配对{idx+1}：监听 {channel['source_config']} → 转发到 {channel['target']}")
@@ -278,7 +300,7 @@ async def main():
         # 消息监听器
         @client.on(events.NewMessage(chats=valid_source_ids))
         async def handler(event):
-            if is_shutting_down:
+            if is_shutting_down or is_restarting:
                 return
             # 全局兜底，单条消息异常不导致程序崩溃
             try:
@@ -376,13 +398,14 @@ async def main():
                     log_with_time(f"❌ 消息处理失败 | 详情：{str(e)}")
         
         await client.run_until_disconnected()
+
 if __name__ == "__main__":
     try:
+        log_with_time("🚀 程序启动中，开启内置自重启模式...")
         asyncio.run(main())
-        log_with_time("✅ 程序已正常退出")
-        sys.exit(0)
     except KeyboardInterrupt:
-        log_with_time("\n✅ 程序已手动停止")
+        log_with_time("\n✅ 程序已手动停止，取消自重启")
     except Exception as e:
-        log_with_time(f"❌ 程序异常退出：{str(e)}")
-        sys.exit(1)
+        log_with_time(f"❌ 程序异常退出：{str(e)}，5秒后自动重启...")
+        time.sleep(5)
+        restart_program()
