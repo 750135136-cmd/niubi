@@ -15,23 +15,35 @@ session_name = "session"
 # 频道转发配对，可自由增减
 channels = [
     {'source': '@wenan77','target': '@wnffx'},
-    {'source': '@xdgd18','target': '@hrgxx'}
+    {'source': '@hotchigua','target': '@hrgxx'}
 ]
-max_text_length = 300  # 最大允许的文本长度
-forward_interval = 5  # 转发间隔（秒），已调大降低限流风险
-media_group_wait_time = 12  # 媒体组等待时长（秒），核心修复项，确保同组内容完整接收
+max_text_length = 500  # 最大允许的文本长度
+forward_interval = 8  # 转发间隔（秒），已调大降低限流风险
+media_group_wait_time = 20  # 媒体组等待时长（秒），核心修复项，确保同组内容完整接收
 max_cache_size = 2000  # 已处理消息ID缓存上限
 restart_interval_hours = 12  # 定时重启间隔（小时）
 max_retry = 5  # 发送失败最大重试次数
 ALLOWED_VIDEO_MIMES = {'video/mp4', 'video/mov', 'video/avi', 'video/mkv', 'video/webm', 'video/flv'}
+
+# ========== 功能开关（可自由开启/关闭） ==========
+ENABLE_BLOCK_LINK = True  # 拦截带链接的消息：True=开启拦截，False=关闭
+ENABLE_BLOCK_FORWARDED = True  # 拦截转发来源消息：True=开启拦截，False=关闭
+ENABLE_REPLY_FORWARD = True  # 保留回复引用转发：True=开启，同步原频道的回复/引用结构；False=关闭
+
 # ========== 全局状态 ==========
 stop_event = asyncio.Event()
 shutdown_lock = asyncio.Lock()
 is_shutting_down = False
-is_restarting = False  # 新增：防重复重启标记
+is_restarting = False  # 防重复重启标记
 last_forward_time = 0
 forward_lock = asyncio.Lock()
 processed_msg_ids = deque(maxlen=max_cache_size)
+
+# ========== 新增：回复引用映射缓存（核心） ==========
+forward_id_map = dict()  # 键：(源频道ID, 源消息ID)，值：目标频道转发后的消息ID
+forward_id_lock = asyncio.Lock()  # 异步锁，保证多协程读写安全
+forward_id_order = deque(maxlen=max_cache_size)  # 控制缓存长度，自动淘汰最旧数据，避免内存溢出
+
 media_group_cache = {}
 media_group_lock = asyncio.Lock()
 valid_channels = []
@@ -39,12 +51,51 @@ channel_map = {}
 valid_source_ids = []
 active_tasks = set()
 client = None
+
 # ========== 工具函数 ==========
 def log_with_time(msg: str):
     beijing_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{beijing_time}] {msg}")
 
-# 新增：进程自重启核心函数
+# ========== 新增：链接检测函数 ==========
+def has_link(text):
+    """检测文本中是否包含链接，覆盖外部链接+Telegram内部频道链接"""
+    if not text:
+        return False
+    link_pattern = r"https?://[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+|t\.me/[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+"
+    return bool(re.search(link_pattern, text))
+
+# ========== 新增：保存源消息→目标消息ID映射（核心） ==========
+async def save_forward_id_mapping(source_chat_id, source_msg_id, target_msg_id):
+    """转发成功后，保存源消息与目标消息的ID对应关系，用于回复引用同步"""
+    if not ENABLE_REPLY_FORWARD:
+        return
+    async with forward_id_lock:
+        map_key = (source_chat_id, source_msg_id)
+        # 已存在的key，先清除旧顺序
+        if map_key in forward_id_map:
+            try:
+                forward_id_order.remove(map_key)
+            except ValueError:
+                pass
+        # 新增映射与顺序
+        forward_id_map[map_key] = target_msg_id
+        forward_id_order.append(map_key)
+        # 超过缓存上限，自动淘汰最旧的映射
+        while len(forward_id_order) > max_cache_size:
+            old_key = forward_id_order.popleft()
+            forward_id_map.pop(old_key, None)
+
+# ========== 新增：获取源消息对应的目标频道回复ID（核心） ==========
+async def get_target_reply_id(source_chat_id, source_reply_msg_id):
+    """根据源频道被回复的消息ID，查找目标频道对应的消息ID"""
+    if not ENABLE_REPLY_FORWARD or not source_reply_msg_id:
+        return None
+    async with forward_id_lock:
+        map_key = (source_chat_id, source_reply_msg_id)
+        return forward_id_map.get(map_key, None)
+
+# 进程自重启核心函数
 def restart_program():
     global is_restarting
     if is_restarting:
@@ -57,7 +108,7 @@ def restart_program():
 def clean_text(text):
     if not text:
         return ""
-    # 清除链接、@用户名、多余换行（已修复正则转义警告）
+    # 清除链接、@用户名、多余换行
     text = re.sub(r"https?://[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+|t\.me/[^\s\u4e00-\u9fa5，。！？；：\"'()（）、]+", '', text)
     text = re.sub(r"@[a-zA-Z0-9_]{5,32}", '', text)
     return re.sub(r"\n+", '\n', text).strip()
@@ -85,7 +136,7 @@ async def auto_restart_scheduler():
         stop_event.set()
         break
 
-# ========== 优雅关闭（修改：关闭后执行自重启） ==========
+# ========== 优雅关闭 ==========
 async def graceful_shutdown(client: TelegramClient):
     global is_shutting_down
     async with shutdown_lock:
@@ -95,19 +146,16 @@ async def graceful_shutdown(client: TelegramClient):
     log_with_time("🔌 开始优雅关闭，等待所有活跃任务完成...")
     if active_tasks:
         try:
-            # 最多等待30秒，超时强制继续关闭，避免无限卡住
             await asyncio.wait_for(asyncio.gather(*active_tasks, return_exceptions=True), timeout=30)
             log_with_time("✅ 所有活跃任务已完成")
         except asyncio.TimeoutError:
             log_with_time("⚠️  等待活跃任务超时（30秒），强制继续关闭流程")
     log_with_time("✅ 正在断开客户端连接...")
     try:
-        # 断开连接也加超时，避免网络异常卡死
         await asyncio.wait_for(client.disconnect(), timeout=10)
         log_with_time("✅ 客户端已正常断开，即将执行自重启")
     except Exception as e:
         log_with_time(f"⚠️  断开连接时出错：{str(e)}，强制执行自重启")
-    # 核心修改：关闭完成后执行自重启
     restart_program()
 
 async def stop_watcher(client: TelegramClient):
@@ -182,15 +230,31 @@ async def process_media_group(grouped_id):
             log_with_time(f"⏭️  已跳过 | 源：{source_name} | 同一条消息已转发")
             return
         
-        # 拦截带按钮的媒体组消息，同组任意一条消息带按钮直接拦截
-        has_button = False
-        for msg in msg_list:
-            if msg.reply_markup and hasattr(msg.reply_markup, 'rows') and len(msg.reply_markup.rows) > 0:
-                has_button = True
-                break
+        # 拦截转发来源消息
+        if ENABLE_BLOCK_FORWARDED:
+            has_forwarded = any(msg.forward is not None for msg in msg_list)
+            if has_forwarded:
+                log_with_time(f"⏭️  已拦截 | 源：{source_name} | 媒体组包含转发来源内容，不符合转发规则")
+                return
+
+        # 拦截带链接消息
+        if ENABLE_BLOCK_LINK:
+            has_link_content = any(has_link(msg.text) for msg in msg_list)
+            if has_link_content:
+                log_with_time(f"⏭️  已拦截 | 源：{source_name} | 媒体组消息包含链接，不符合转发规则")
+                return
+
+        # 拦截带按钮消息
+        has_button = any(msg.reply_markup and hasattr(msg.reply_markup, 'rows') and len(msg.reply_markup.rows) > 0 for msg in msg_list)
         if has_button:
             log_with_time(f"⏭️  已拦截 | 源：{source_name} | 媒体组消息带有按钮，不符合转发规则")
             return
+        
+        # ========== 新增：媒体组回复引用匹配 ==========
+        source_reply_msg_id = first_msg.reply_to_msg_id if first_msg.reply_to else None
+        target_reply_id = await get_target_reply_id(source_chat.id, source_reply_msg_id)
+        if target_reply_id:
+            log_with_time(f"ℹ️  媒体组匹配到回复引用 | 源：{source_name} | 原回复ID：{source_reply_msg_id} → 目标ID：{target_reply_id}")
         
         processed_msg_ids.append( (source_chat.id, first_msg.id) )
         
@@ -221,28 +285,39 @@ async def process_media_group(grouped_id):
             return
         
         await rate_limit_wait()
-        # 全有或全无重试逻辑，修复部分发送导致的拆分
+        # 全有或全无重试逻辑
         retry_count = 0
         send_success = False
+        sent_msg = None
         while retry_count < max_retry and not send_success:
             try:
-                await client.send_message(target_item['target_entity'], message=cleaned_text, file=valid_media, silent=True)
-                log_with_time(f"✅ 媒体组转发成功 | 源：{source_name} → 目标：{target_item['target']} | 媒体数：{len(valid_media)}")
+                # 新增：发送时带上回复引用ID
+                sent_msg = await client.send_message(
+                    target_item['target_entity'], 
+                    message=cleaned_text, 
+                    file=valid_media, 
+                    silent=True,
+                    reply_to=target_reply_id
+                )
                 send_success = True
                 break
             except FloodWaitError as e:
                 retry_count += 1
-                wait_time = e.seconds + 5  # 额外增加等待时长，避免再次触发限流
+                wait_time = e.seconds + 5
                 log_with_time(f"⚠️  触发限流，等待{wait_time}秒后重试（第{retry_count}次）")
                 await asyncio.sleep(wait_time)
             except Exception as e:
                 retry_count += 1
                 log_with_time(f"❌ 媒体组转发失败，第{retry_count}次重试 | 详情：{str(e)}")
                 await asyncio.sleep(3)
-        if not send_success:
+        
+        if send_success and sent_msg:
+            # 新增：转发成功后保存ID映射，用于后续回复引用
+            await save_forward_id_mapping(source_chat.id, first_msg.id, sent_msg.id)
+            log_with_time(f"✅ 媒体组转发成功 | 源：{source_name} → 目标：{target_item['target']} | 媒体数：{len(valid_media)} | 目标消息ID：{sent_msg.id}")
+        else:
             log_with_time(f"❌ 媒体组最终转发失败，已跳过 | 源：{source_name}")
     except Exception as e:
-        # 全局兜底，任何异常不导致程序崩溃
         if "Could not find a matching Constructor ID" in str(e):
             log_with_time(f"⚠️  跳过无法解析的媒体组消息 | 详情：Telegram协议不兼容，已跳过该条消息")
         else:
@@ -254,7 +329,6 @@ async def process_media_group(grouped_id):
 # ========== 主程序 ==========
 async def main():
     global client
-    # 已优化兼容的连接配置，移除不兼容的自定义连接类型
     client = TelegramClient(
         session_name, api_id, api_hash,
         auto_reconnect=True, connection_retries=None, retry_delay=5, timeout=60,
@@ -287,13 +361,19 @@ async def main():
         log_with_time("\n=== 转发规则已生效 ===")
         log_with_time(f"✅ 允许转发：带图片/视频的消息（含多图媒体组），清洗后文本≤{max_text_length}字，无按钮")
         log_with_time(f"❌ 禁止转发：纯文字消息、文本超{max_text_length}字的消息、非图片/视频媒体、带按钮的消息")
+        if ENABLE_BLOCK_LINK:
+            log_with_time(f"❌ 禁止转发：包含任何链接的消息（已开启拦截）")
+        if ENABLE_BLOCK_FORWARDED:
+            log_with_time(f"❌ 禁止转发：从其他用户/群/频道转发到源频道的消息（已开启拦截）")
+        if ENABLE_REPLY_FORWARD:
+            log_with_time(f"✅ 已开启：转发时保留原频道的回复/引用结构，同步上下文关联")
         log_with_time(f"⏰ 定时重启：已开启，每{restart_interval_hours}小时自动重启一次（内置自重启，无需平台干预）")
         log_with_time(f"🕵️  无来源转发：已开启，转发消息无任何原频道标识")
         for idx, channel in enumerate(valid_channels):
             log_with_time(f"配对{idx+1}：监听 {channel['source_config']} → 转发到 {channel['target']}")
         log_with_time("\n机器人已启动，正在监听消息...\n")
         
-        # 启动定时任务（已修复死锁：stop_watcher不加入活跃任务）
+        # 启动定时任务
         track_task(asyncio.create_task(auto_restart_scheduler()))
         asyncio.create_task(stop_watcher(client))
         
@@ -315,27 +395,39 @@ async def main():
                     log_with_time(f"⏭️  已拦截 | 源：{source_name} | 无匹配目标频道")
                     return
                 
-                # 拦截带按钮的单条消息，优先执行
+                # 拦截带按钮的消息
                 if msg.reply_markup and hasattr(msg.reply_markup, 'rows') and len(msg.reply_markup.rows) > 0:
                     log_with_time(f"⏭️  已拦截 | 源：{source_name} | 消息带有按钮，不符合转发规则")
                     return
+
+                # 拦截转发来源消息
+                if ENABLE_BLOCK_FORWARDED and msg.forward is not None:
+                    log_with_time(f"⏭️  已拦截 | 源：{source_name} | 消息为转发来源内容，不符合转发规则")
+                    return
+
+                # 拦截带链接消息
+                if ENABLE_BLOCK_LINK and has_link(msg.text):
+                    log_with_time(f"⏭️  已拦截 | 源：{source_name} | 消息包含链接，不符合转发规则")
+                    return
+                
+                # ========== 新增：单条消息回复引用匹配 ==========
+                source_reply_msg_id = msg.reply_to_msg_id if msg.reply_to else None
+                target_reply_id = await get_target_reply_id(source_id, source_reply_msg_id)
+                if target_reply_id:
+                    log_with_time(f"ℹ️  单媒体消息匹配到回复引用 | 源：{source_name} | 原回复ID：{source_reply_msg_id} → 目标ID：{target_reply_id}")
                 
                 # 媒体组处理逻辑
                 if grouped_id:
                     async with media_group_lock:
                         is_new_group = grouped_id not in media_group_cache
                         if is_new_group:
-                            # 新分组初始化缓存
                             media_group_cache[grouped_id] = {
                                 'msg_list': [], 'source_chat': source_chat,
                                 'target_item': target_item, 'source_name': source_name
                             }
-                        # 追加当前消息到分组
                         media_group_cache[grouped_id]['msg_list'].append(msg)
-                        # 仅新分组创建延迟处理任务，确保所有同组消息都能追加完成
                         if is_new_group:
                             async def delayed_process():
-                                # 等待完整时长后再处理，确保同组所有消息已接收
                                 await asyncio.sleep(media_group_wait_time)
                                 await process_media_group(grouped_id)
                             track_task(asyncio.create_task(delayed_process()))
@@ -373,10 +465,17 @@ async def main():
                 # 单媒体重试逻辑
                 retry_count = 0
                 send_success = False
+                sent_msg = None
                 while retry_count < max_retry and not send_success:
                     try:
-                        await client.send_message(target_item['target_entity'], message=cleaned_text, file=valid_media, silent=True)
-                        log_with_time(f"✅ 单媒体转发成功 | 源：{source_name} → 目标：{target_item['target']}")
+                        # 新增：发送时带上回复引用ID
+                        sent_msg = await client.send_message(
+                            target_item['target_entity'], 
+                            message=cleaned_text, 
+                            file=valid_media, 
+                            silent=True,
+                            reply_to=target_reply_id
+                        )
                         send_success = True
                         break
                     except FloodWaitError as e:
@@ -388,10 +487,14 @@ async def main():
                         retry_count += 1
                         log_with_time(f"❌ 单媒体转发失败，第{retry_count}次重试 | 详情：{str(e)}")
                         await asyncio.sleep(3)
-                if not send_success:
+                
+                if send_success and sent_msg:
+                    # 新增：转发成功后保存ID映射，用于后续回复引用
+                    await save_forward_id_mapping(source_id, msg.id, sent_msg.id)
+                    log_with_time(f"✅ 单媒体转发成功 | 源：{source_name} → 目标：{target_item['target']} | 目标消息ID：{sent_msg.id}")
+                else:
                     log_with_time(f"❌ 单媒体最终转发失败，已跳过 | 源：{source_name}")
             except Exception as e:
-                # 核心兜底，捕获协议解析错误
                 if "Could not find a matching Constructor ID" in str(e):
                     log_with_time(f"⚠️  跳过无法解析的消息 | 详情：Telegram协议不兼容，已跳过该条消息")
                 else:
